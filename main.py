@@ -11,13 +11,12 @@ import bcrypt
 
 app = FastAPI(title="Maruy Bags API", version="6.2.0")
 
-# Dominios permitidos — agrega aquí tus dominios de producción
+# ── CORS ──────────────────────────────────────────────────────────────────────
 ALLOWED_ORIGINS = [
     o.strip() for o in
     os.getenv("ALLOWED_ORIGINS", "http://localhost,http://127.0.0.1").split(",")
     if o.strip()
 ]
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -30,33 +29,10 @@ app.add_middleware(
 os.makedirs("static/uploads", exist_ok=True)
 app.mount("/uploads", StaticFiles(directory="static/uploads"), name="uploads")
 
-# ── SUPABASE STORAGE ──────────────────────────────────────────────────────────
-SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "imagenes-productos")
-
-async def subir_a_supabase_storage(archivo: UploadFile) -> str:
-    """Sube un archivo a Supabase Storage y retorna la URL publica."""
-    ext = os.path.splitext(archivo.filename)[1].lower()
-    nombre = f"{uuid.uuid4().hex}{ext}"
-    contenido = await archivo.read()
-
-    upload_url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{nombre}"
-    headers_storage = {
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Content-Type": archivo.content_type or "image/jpeg",
-    }
-    async with httpx.AsyncClient() as c:
-        res = await c.post(upload_url, headers=headers_storage, content=contenido)
-
-    if res.status_code not in [200, 201]:
-        raise HTTPException(500, f"Error subiendo a Supabase Storage: {res.text}")
-
-    url_publica = f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{nombre}"
-    return url_publica
-
 # ── SUPABASE ──────────────────────────────────────────────────────────────────
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+SUPABASE_URL    = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY    = os.getenv("SUPABASE_KEY", "")
+SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "imagenes-productos")
 SB = {
     "apikey": SUPABASE_KEY,
     "Authorization": f"Bearer {SUPABASE_KEY}",
@@ -65,11 +41,28 @@ SB = {
 }
 def sb(t): return f"{SUPABASE_URL}/rest/v1/{t}"
 
+# ── SUPABASE STORAGE ──────────────────────────────────────────────────────────
+async def subir_a_supabase_storage(archivo: UploadFile) -> str:
+    ext = os.path.splitext(archivo.filename)[1].lower()
+    nombre = f"{uuid.uuid4().hex}{ext}"
+    contenido = await archivo.read()
+    upload_url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{nombre}"
+    headers_storage = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": archivo.content_type or "image/jpeg",
+    }
+    async with httpx.AsyncClient() as c:
+        res = await c.post(upload_url, headers=headers_storage, content=contenido)
+    if res.status_code not in [200, 201]:
+        raise HTTPException(500, f"Error subiendo imagen: {res.text}")
+    return f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{nombre}"
+
 # ── JWT ───────────────────────────────────────────────────────────────────────
 JWT_SECRET = os.getenv("JWT_SECRET", "")
 if not JWT_SECRET:
-    raise RuntimeError("⛔ JWT_SECRET no está configurado. Agrega esta variable de entorno en Render.")
-JWT_HOURS  = 24
+    raise RuntimeError("JWT_SECRET no configurado. Agrega esta variable en Render.")
+JWT_HOURS = 24
 
 def b64e(d): return base64.urlsafe_b64encode(d).rstrip(b'=').decode()
 def b64d(s):
@@ -114,7 +107,7 @@ class Producto(BaseModel):
     color: str
     badge: Optional[str] = None
     descripcion: str
-    imagenes: Optional[List[str]] = []  # Lista de URLs de imágenes
+    imagenes: Optional[List[str]] = []
     stock: int = 0
 
 class ProductoUpdate(BaseModel):
@@ -201,7 +194,6 @@ async def actualizar_usuario(id: int, cambios: UsuarioUpdate, u: dict = Depends(
 
 @app.delete("/api/usuarios/{id}")
 async def eliminar_usuario(id: int, u: dict = Depends(require_admin)):
-    # Verificar que no se elimine a sí mismo
     async with httpx.AsyncClient() as c:
         res = await c.get(sb("usuarios")+f"?id=eq.{id}&select=username", headers=SB)
     data = res.json()
@@ -210,9 +202,17 @@ async def eliminar_usuario(id: int, u: dict = Depends(require_admin)):
     async with httpx.AsyncClient() as c:
         res = await c.delete(sb("usuarios")+f"?id=eq.{id}", headers=SB)
     if res.status_code not in [200,204]: raise HTTPException(500,"Error eliminando usuario")
-    return {"mensaje": f"Usuario {id} eliminado permanentemente"}
+    return {"mensaje": f"Usuario {id} eliminado"}
 
 # ── PRODUCTOS ─────────────────────────────────────────────────────────────────
+def normalizar_imagenes(p):
+    if not p.get("imagenes") or not isinstance(p["imagenes"], list):
+        img = p.get("imagen","")
+        p["imagenes"] = [img] if img else []
+    else:
+        p["imagenes"] = [i for i in p["imagenes"] if i]
+    return p
+
 @app.get("/api/productos")
 async def listar_productos(categoria: Optional[str]=None, color: Optional[str]=None):
     url = sb("productos") + "?select=*&order=id.asc"
@@ -221,14 +221,7 @@ async def listar_productos(categoria: Optional[str]=None, color: Optional[str]=N
     async with httpx.AsyncClient() as c:
         res = await c.get(url, headers=SB)
     if res.status_code != 200: raise HTTPException(500,"Error obteniendo productos")
-    productos = res.json()
-    # Normalizar: asegurar que imagenes sea siempre una lista
-    for p in productos:
-        if "imagenes" not in p or not p["imagenes"]:
-            # Compatibilidad con campo imagen antiguo
-            img = p.get("imagen","")
-            p["imagenes"] = [img] if img else []
-    return productos
+    return [normalizar_imagenes(p) for p in res.json()]
 
 @app.get("/api/productos/{id}")
 async def obtener_producto(id: int):
@@ -236,28 +229,20 @@ async def obtener_producto(id: int):
         res = await c.get(sb("productos")+f"?id=eq.{id}&select=*", headers=SB)
     data = res.json()
     if not data: raise HTTPException(404,"Producto no encontrado")
-    p = data[0]
-    if "imagenes" not in p or not p["imagenes"]:
-        img = p.get("imagen","")
-        p["imagenes"] = [img] if img else []
-    return p
+    return normalizar_imagenes(data[0])
 
 @app.post("/api/productos", status_code=201)
 async def crear_producto(p: Producto, u: dict = Depends(require_admin)):
     body = p.dict()
-    # imagenes como array JSON
     body["imagenes"] = p.imagenes or []
     async with httpx.AsyncClient() as c:
         res = await c.post(sb("productos"), headers=SB, json=body)
     if res.status_code not in [200,201]: raise HTTPException(500,"Error creando producto")
-    return res.json()[0]
+    return normalizar_imagenes(res.json()[0])
 
 @app.patch("/api/productos/{id}")
 async def actualizar_producto(id: int, cambios: ProductoUpdate, u: dict = Depends(get_user)):
-    data = {}
-    for k, v in cambios.dict().items():
-        if v is not None:
-            data[k] = v
+    data = {k: v for k, v in cambios.dict().items() if v is not None}
     if not data: raise HTTPException(400,"Sin cambios")
     async with httpx.AsyncClient() as c:
         res = await c.patch(sb("productos")+f"?id=eq.{id}", headers=SB, json=data)
@@ -274,10 +259,8 @@ async def eliminar_producto(id: int, u: dict = Depends(require_admin)):
 @app.post("/api/productos/{id}/imagen")
 async def subir_imagen(id: int, archivo: UploadFile = File(...), u: dict = Depends(get_user)):
     ext = os.path.splitext(archivo.filename)[1].lower()
-    if ext not in [".jpg",".jpeg",".png",".webp"]: raise HTTPException(400,"Solo JPG,PNG,WEBP")
-    # Subir a Supabase Storage (URL permanente, no se borra al reiniciar el servidor)
+    if ext not in [".jpg",".jpeg",".png",".webp"]: raise HTTPException(400,"Solo JPG, PNG, WEBP")
     url_img = await subir_a_supabase_storage(archivo)
-    # Agregar a la lista de imágenes existente
     prod = await obtener_producto(id)
     imagenes = prod.get("imagenes", [])
     imagenes.append(url_img)
@@ -313,7 +296,7 @@ async def crear_pedido(pedido: Pedido):
 @app.patch("/api/pedidos/{id}/estado")
 async def cambiar_estado(id: int, estado: str, u: dict = Depends(get_user)):
     validos = ["pendiente","confirmado","enviado","entregado","cancelado"]
-    if estado not in validos: raise HTTPException(400,f"Usa: {validos}")
+    if estado not in validos: raise HTTPException(400,f"Estados válidos: {validos}")
     async with httpx.AsyncClient() as c:
         await c.patch(sb("pedidos")+f"?id=eq.{id}", headers=SB, json={"estado":estado})
     return {"mensaje":f"Pedido {id} → {estado}"}
@@ -341,4 +324,4 @@ async def estadisticas(u: dict = Depends(get_user)):
     }
 
 @app.get("/")
-def root(): return {"mensaje":"Maruy Bags API v6","docs":"/docs"}
+def root(): return {"mensaje":"Maruy Bags API v6.2","docs":"/docs"}
