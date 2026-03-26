@@ -8,7 +8,7 @@ import os, uuid, shutil, hashlib, hmac, base64, json
 from datetime import datetime, timedelta
 import httpx
 
-app = FastAPI(title="Maruy Bags API", version="6.0.0")
+app = FastAPI(title="Maruy Bags API", version="6.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,6 +21,30 @@ app.add_middleware(
 
 os.makedirs("static/uploads", exist_ok=True)
 app.mount("/uploads", StaticFiles(directory="static/uploads"), name="uploads")
+
+# ── SUPABASE STORAGE ──────────────────────────────────────────────────────────
+SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "imagenes-productos")
+
+async def subir_a_supabase_storage(archivo: UploadFile) -> str:
+    """Sube un archivo a Supabase Storage y retorna la URL publica."""
+    ext = os.path.splitext(archivo.filename)[1].lower()
+    nombre = f"{uuid.uuid4().hex}{ext}"
+    contenido = await archivo.read()
+
+    upload_url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{nombre}"
+    headers_storage = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": archivo.content_type or "image/jpeg",
+    }
+    async with httpx.AsyncClient() as c:
+        res = await c.post(upload_url, headers=headers_storage, content=contenido)
+
+    if res.status_code not in [200, 201]:
+        raise HTTPException(500, f"Error subiendo a Supabase Storage: {res.text}")
+
+    url_publica = f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{nombre}"
+    return url_publica
 
 # ── SUPABASE ──────────────────────────────────────────────────────────────────
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
@@ -234,10 +258,8 @@ async def eliminar_producto(id: int, u: dict = Depends(require_admin)):
 async def subir_imagen(id: int, archivo: UploadFile = File(...), u: dict = Depends(get_user)):
     ext = os.path.splitext(archivo.filename)[1].lower()
     if ext not in [".jpg",".jpeg",".png",".webp"]: raise HTTPException(400,"Solo JPG,PNG,WEBP")
-    nombre = f"{uuid.uuid4().hex}{ext}"
-    with open(f"static/uploads/{nombre}", "wb") as f: shutil.copyfileobj(archivo.file, f)
-    base_url = os.getenv("RENDER_EXTERNAL_URL","http://localhost:8000")
-    url_img = f"{base_url}/uploads/{nombre}"
+    # Subir a Supabase Storage (URL permanente, no se borra al reiniciar el servidor)
+    url_img = await subir_a_supabase_storage(archivo)
     # Agregar a la lista de imágenes existente
     prod = await obtener_producto(id)
     imagenes = prod.get("imagenes", [])
