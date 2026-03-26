@@ -4,15 +4,23 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import Optional, List
-import os, uuid, shutil, hashlib, hmac, base64, json
+import os, uuid, hashlib, hmac, base64, json
 from datetime import datetime, timedelta
 import httpx
+import bcrypt
 
-app = FastAPI(title="Maruy Bags API", version="6.1.0")
+app = FastAPI(title="Maruy Bags API", version="6.2.0")
+
+# Dominios permitidos — agrega aquí tus dominios de producción
+ALLOWED_ORIGINS = [
+    o.strip() for o in
+    os.getenv("ALLOWED_ORIGINS", "http://localhost,http://127.0.0.1").split(",")
+    if o.strip()
+]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
     allow_methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS"],
     allow_headers=["*"],
@@ -58,7 +66,9 @@ SB = {
 def sb(t): return f"{SUPABASE_URL}/rest/v1/{t}"
 
 # ── JWT ───────────────────────────────────────────────────────────────────────
-JWT_SECRET = os.getenv("JWT_SECRET", "b073aaec1f47c862ba7257c485fa876d525d14e41188a3d4a134c646492abcb3")
+JWT_SECRET = os.getenv("JWT_SECRET", "")
+if not JWT_SECRET:
+    raise RuntimeError("⛔ JWT_SECRET no está configurado. Agrega esta variable de entorno en Render.")
 JWT_HOURS  = 24
 
 def b64e(d): return base64.urlsafe_b64encode(d).rstrip(b'=').decode()
@@ -138,14 +148,21 @@ class UsuarioUpdate(BaseModel):
 # ── AUTH ──────────────────────────────────────────────────────────────────────
 @app.post("/api/auth/login")
 async def login(req: LoginReq):
-    pwd_hash = hashlib.sha256(req.password.encode()).hexdigest()
     url = sb("usuarios") + f"?username=eq.{req.username.lower()}&activo=eq.true&select=*"
     async with httpx.AsyncClient() as c:
         res = await c.get(url, headers=SB)
     data = res.json()
-    if not data or not hmac.compare_digest(data[0]["password_hash"], pwd_hash):
+    if not data:
         raise HTTPException(401, "Usuario o contraseña incorrectos")
     u = data[0]
+    stored = u["password_hash"]
+    # Soporta bcrypt (nuevo) y SHA-256 legacy (migración automática)
+    if stored.startswith("$2b$") or stored.startswith("$2a$"):
+        ok = bcrypt.checkpw(req.password.encode(), stored.encode())
+    else:
+        ok = hmac.compare_digest(stored, hashlib.sha256(req.password.encode()).hexdigest())
+    if not ok:
+        raise HTTPException(401, "Usuario o contraseña incorrectos")
     return {"access_token": crear_jwt(u["username"], u["rol"]),
             "token_type": "bearer", "username": u["username"],
             "rol": u["rol"], "expires_in": JWT_HOURS * 3600}
@@ -164,7 +181,7 @@ async def listar_usuarios(u: dict = Depends(require_admin)):
 @app.post("/api/usuarios", status_code=201)
 async def crear_usuario(nuevo: UsuarioCreate, u: dict = Depends(require_admin)):
     if nuevo.rol not in ["admin","empleado"]: raise HTTPException(400,"Rol inválido")
-    pwd_hash = hashlib.sha256(nuevo.password.encode()).hexdigest()
+    pwd_hash = bcrypt.hashpw(nuevo.password.encode(), bcrypt.gensalt()).decode()
     body = {"username": nuevo.username.lower(), "password_hash": pwd_hash, "rol": nuevo.rol, "activo": True}
     async with httpx.AsyncClient() as c:
         res = await c.post(sb("usuarios"), headers=SB, json=body)
@@ -174,7 +191,7 @@ async def crear_usuario(nuevo: UsuarioCreate, u: dict = Depends(require_admin)):
 @app.patch("/api/usuarios/{id}")
 async def actualizar_usuario(id: int, cambios: UsuarioUpdate, u: dict = Depends(require_admin)):
     body = {}
-    if cambios.password: body["password_hash"] = hashlib.sha256(cambios.password.encode()).hexdigest()
+    if cambios.password: body["password_hash"] = bcrypt.hashpw(cambios.password.encode(), bcrypt.gensalt()).decode()
     if cambios.rol:      body["rol"] = cambios.rol
     if cambios.activo is not None: body["activo"] = cambios.activo
     if not body: raise HTTPException(400,"Sin cambios")
