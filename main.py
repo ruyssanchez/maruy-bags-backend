@@ -283,10 +283,20 @@ async def actualizar_producto(id: int, cambios: ProductoUpdate, u: dict = Depend
 
 @app.delete("/api/productos/{id}")
 async def eliminar_producto(id: int, u: dict = Depends(require_admin)):
+    # Verificar que existe
     async with httpx.AsyncClient() as c:
-        res = await c.delete(sb("productos")+f"?id=eq.{id}", headers=SB)
-    if res.status_code not in [200,204]: raise HTTPException(500,"Error eliminando")
-    return {"mensaje": f"Producto {id} eliminado", "por": u.get("sub")}
+        check = await c.get(sb("productos")+f"?id=eq.{id}&select=id,nombre", headers=SB)
+    if check.status_code != 200 or not check.json():
+        raise HTTPException(404, f"Producto {id} no encontrado")
+    nombre_prod = check.json()[0].get("nombre", str(id))
+    # Eliminar con header correcto para Supabase
+    headers_delete = dict(SB)
+    headers_delete["Prefer"] = "return=minimal"
+    async with httpx.AsyncClient() as c:
+        res = await c.delete(sb("productos")+f"?id=eq.{id}", headers=headers_delete)
+    if res.status_code not in [200, 204]:
+        raise HTTPException(500, f"Error eliminando en BD: {res.status_code} - {res.text}")
+    return {"mensaje": f"Producto eliminado: {nombre_prod}", "por": u.get("sub")}
 
 @app.post("/api/productos/{id}/imagen")
 async def subir_imagen(id: int, archivo: UploadFile = File(...), u: dict = Depends(get_user)):
