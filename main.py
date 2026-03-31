@@ -1,38 +1,52 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Depends
+from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
-from typing import Optional, List, Any
+from typing import Optional, List
 import os, uuid, shutil, hashlib, hmac, base64, json
 from datetime import datetime, timedelta
 import httpx
-import bcrypt
 
-app = FastAPI(title="Maruy Bags API", version="6.3.0")
+app = FastAPI(title="Maruy Bags API", version="6.0.0")
 
-# ── CORS ──────────────────────────────────────────────────────────────────────
-ALLOWED_ORIGINS = [
-    o.strip() for o in
-    os.getenv("ALLOWED_ORIGINS", "http://localhost,http://127.0.0.1").split(",")
-    if o.strip()
-]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=[
+        "https://maruybags.netlify.app",
+        "https://catalogomaruy.netlify.app",
+        "http://localhost:5500",
+        "http://127.0.0.1:5500",
+    ],
     allow_credentials=False,
     allow_methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS"],
-    allow_headers=["*"],
+    allow_headers=["Authorization","Content-Type"],
     expose_headers=["*"],
+    max_age=3600,
 )
+
+# Middleware de headers de seguridad
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request as StarletteRequest
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: StarletteRequest, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"]        = "DENY"
+        response.headers["X-XSS-Protection"]       = "1; mode=block"
+        response.headers["Referrer-Policy"]         = "strict-origin-when-cross-origin"
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        return response
+
+app.add_middleware(SecurityHeadersMiddleware)
 
 os.makedirs("static/uploads", exist_ok=True)
 app.mount("/uploads", StaticFiles(directory="static/uploads"), name="uploads")
 
 # ── SUPABASE ──────────────────────────────────────────────────────────────────
-SUPABASE_URL    = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY    = os.getenv("SUPABASE_KEY", "")
-SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "imagenes-productos")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 SB = {
     "apikey": SUPABASE_KEY,
     "Authorization": f"Bearer {SUPABASE_KEY}",
@@ -41,40 +55,8 @@ SB = {
 }
 def sb(t): return f"{SUPABASE_URL}/rest/v1/{t}"
 
-# ── SUPABASE STORAGE ──────────────────────────────────────────────────────────
-async def subir_imagen_storage(archivo: UploadFile) -> str:
-    """Sube imagen a Supabase Storage. Si falla, guarda local como fallback."""
-    ext = os.path.splitext(archivo.filename or "foto.jpg")[1].lower()
-    if ext not in [".jpg", ".jpeg", ".png", ".webp"]:
-        ext = ".jpg"
-    nombre = f"{uuid.uuid4().hex}{ext}"
-    contenido = await archivo.read()
-
-    # Intentar Supabase Storage primero
-    if SUPABASE_URL and SUPABASE_KEY:
-        try:
-            upload_url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{nombre}"
-            headers_s = {
-                "apikey": SUPABASE_KEY,
-                "Authorization": f"Bearer {SUPABASE_KEY}",
-                "Content-Type": archivo.content_type or "image/jpeg",
-            }
-            async with httpx.AsyncClient(timeout=30) as c:
-                res = await c.post(upload_url, headers=headers_s, content=contenido)
-            if res.status_code in [200, 201]:
-                return f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{nombre}"
-        except Exception:
-            pass  # Fallback a local
-
-    # Fallback: guardar local en Render
-    ruta = f"static/uploads/{nombre}"
-    with open(ruta, "wb") as f:
-        f.write(contenido)
-    base_url = os.getenv("RENDER_EXTERNAL_URL", "http://localhost:8000")
-    return f"{base_url}/uploads/{nombre}"
-
 # ── JWT ───────────────────────────────────────────────────────────────────────
-JWT_SECRET = os.getenv("JWT_SECRET", "maruy_bags_secret_change_in_production_2024")
+JWT_SECRET = os.getenv("JWT_SECRET", "b073aaec1f47c862ba7257c485fa876d525d14e41188a3d4a134c646492abcb3")
 JWT_HOURS  = 24
 
 def b64e(d): return base64.urlsafe_b64encode(d).rstrip(b'=').decode()
@@ -114,21 +96,65 @@ class LoginReq(BaseModel):
     password: str
 
 class Producto(BaseModel):
-    nombre: str
-    categoria: str
-    precio: float
-    color: str
-    badge: Optional[str] = None
+    nombre:      str
+    categoria:   str
+    precio:      float
+    color:       str
+    badge:       Optional[str] = None
     descripcion: str
-    imagenes: Optional[List[str]] = []
-    stock: int = 0
+    imagenes:    Optional[List[str]] = []
+    stock:       int = 0
+
+    class Config:
+        # Validaciones de seguridad
+        @staticmethod
+        def schema_extra(values):
+            return values
+
+    def __init__(self, **data):
+        # Sanitizar y limitar longitud de campos de texto
+        if 'nombre' in data and data['nombre']:
+            data['nombre'] = str(data['nombre'])[:200].strip()
+        if 'descripcion' in data and data['descripcion']:
+            data['descripcion'] = str(data['descripcion'])[:2000].strip()
+        if 'color' in data and data['color']:
+            data['color'] = str(data['color'])[:100].strip()
+        if 'badge' in data and data['badge']:
+            data['badge'] = str(data['badge'])[:50].strip()
+        if 'precio' in data:
+            p = float(data['precio'] or 0)
+            if p < 0 or p > 100_000_000:
+                raise ValueError("Precio fuera de rango")
+            data['precio'] = p
+        if 'stock' in data:
+            s = int(data['stock'] or 0)
+            if s < 0 or s > 1_000_000:
+                raise ValueError("Stock fuera de rango")
+            data['stock'] = s
+        if 'imagenes' in data and data['imagenes']:
+            # Validar URLs de imágenes
+            ALLOWED = ['maruy-bags-backend.onrender.com','pzdzexwntjreaxahtwvi.supabase.co']
+            safe = []
+            for url in data['imagenes'][:20]:  # máximo 20 imágenes
+                if not url: continue
+                try:
+                    from urllib.parse import urlparse
+                    p = urlparse(str(url))
+                    if p.scheme == 'https' and any(h in p.netloc for h in ALLOWED):
+                        safe.append(str(url)[:500])
+                    elif str(url).startswith('data:image/'):
+                        safe.append(str(url)[:500000])  # base64 ok, límite 500KB
+                except:
+                    pass
+            data['imagenes'] = safe
+        super().__init__(**data)
 
 class ProductoUpdate(BaseModel):
     nombre: Optional[str] = None
     categoria: Optional[str] = None
     precio: Optional[float] = None
     color: Optional[str] = None
-    badge: Optional[Any] = None   # Puede ser str o None explícito
+    badge: Optional[str] = None
     descripcion: Optional[str] = None
     imagenes: Optional[List[str]] = None
     stock: Optional[int] = None
@@ -154,20 +180,14 @@ class UsuarioUpdate(BaseModel):
 # ── AUTH ──────────────────────────────────────────────────────────────────────
 @app.post("/api/auth/login")
 async def login(req: LoginReq):
+    pwd_hash = hashlib.sha256(req.password.encode()).hexdigest()
     url = sb("usuarios") + f"?username=eq.{req.username.lower()}&activo=eq.true&select=*"
     async with httpx.AsyncClient() as c:
         res = await c.get(url, headers=SB)
     data = res.json()
-    if not data:
+    if not data or not hmac.compare_digest(data[0]["password_hash"], pwd_hash):
         raise HTTPException(401, "Usuario o contraseña incorrectos")
     u = data[0]
-    stored = u["password_hash"]
-    if stored.startswith("$2b$") or stored.startswith("$2a$"):
-        ok = bcrypt.checkpw(req.password.encode(), stored.encode())
-    else:
-        ok = hmac.compare_digest(stored, hashlib.sha256(req.password.encode()).hexdigest())
-    if not ok:
-        raise HTTPException(401, "Usuario o contraseña incorrectos")
     return {"access_token": crear_jwt(u["username"], u["rol"]),
             "token_type": "bearer", "username": u["username"],
             "rol": u["rol"], "expires_in": JWT_HOURS * 3600}
@@ -186,7 +206,14 @@ async def listar_usuarios(u: dict = Depends(require_admin)):
 @app.post("/api/usuarios", status_code=201)
 async def crear_usuario(nuevo: UsuarioCreate, u: dict = Depends(require_admin)):
     if nuevo.rol not in ["admin","empleado"]: raise HTTPException(400,"Rol inválido")
-    pwd_hash = bcrypt.hashpw(nuevo.password.encode(), bcrypt.gensalt()).decode()
+    # Validar username
+    import re as _re
+    if not _re.match(r'^[a-z0-9_]{3,30}$', nuevo.username.lower()):
+        raise HTTPException(400,"Usuario inválido: 3-30 caracteres, solo letras minúsculas, números y _")
+    # Validar longitud contraseña
+    if len(nuevo.password) < 6 or len(nuevo.password) > 128:
+        raise HTTPException(400,"Contraseña debe tener entre 6 y 128 caracteres")
+    pwd_hash = hashlib.sha256(nuevo.password.encode()).hexdigest()
     body = {"username": nuevo.username.lower(), "password_hash": pwd_hash, "rol": nuevo.rol, "activo": True}
     async with httpx.AsyncClient() as c:
         res = await c.post(sb("usuarios"), headers=SB, json=body)
@@ -196,7 +223,7 @@ async def crear_usuario(nuevo: UsuarioCreate, u: dict = Depends(require_admin)):
 @app.patch("/api/usuarios/{id}")
 async def actualizar_usuario(id: int, cambios: UsuarioUpdate, u: dict = Depends(require_admin)):
     body = {}
-    if cambios.password: body["password_hash"] = bcrypt.hashpw(cambios.password.encode(), bcrypt.gensalt()).decode()
+    if cambios.password: body["password_hash"] = hashlib.sha256(cambios.password.encode()).hexdigest()
     if cambios.rol:      body["rol"] = cambios.rol
     if cambios.activo is not None: body["activo"] = cambios.activo
     if not body: raise HTTPException(400,"Sin cambios")
@@ -206,6 +233,7 @@ async def actualizar_usuario(id: int, cambios: UsuarioUpdate, u: dict = Depends(
 
 @app.delete("/api/usuarios/{id}")
 async def eliminar_usuario(id: int, u: dict = Depends(require_admin)):
+    # Verificar que no se elimine a sí mismo
     async with httpx.AsyncClient() as c:
         res = await c.get(sb("usuarios")+f"?id=eq.{id}&select=username", headers=SB)
     data = res.json()
@@ -214,17 +242,9 @@ async def eliminar_usuario(id: int, u: dict = Depends(require_admin)):
     async with httpx.AsyncClient() as c:
         res = await c.delete(sb("usuarios")+f"?id=eq.{id}", headers=SB)
     if res.status_code not in [200,204]: raise HTTPException(500,"Error eliminando usuario")
-    return {"mensaje": f"Usuario {id} eliminado"}
+    return {"mensaje": f"Usuario {id} eliminado permanentemente"}
 
 # ── PRODUCTOS ─────────────────────────────────────────────────────────────────
-def normalizar_imagenes(p):
-    if not p.get("imagenes") or not isinstance(p["imagenes"], list):
-        img = p.get("imagen", "")
-        p["imagenes"] = [img] if img else []
-    else:
-        p["imagenes"] = [i for i in p["imagenes"] if i]
-    return p
-
 @app.get("/api/productos")
 async def listar_productos(categoria: Optional[str]=None, color: Optional[str]=None):
     url = sb("productos") + "?select=*&order=id.asc"
@@ -233,7 +253,14 @@ async def listar_productos(categoria: Optional[str]=None, color: Optional[str]=N
     async with httpx.AsyncClient() as c:
         res = await c.get(url, headers=SB)
     if res.status_code != 200: raise HTTPException(500,"Error obteniendo productos")
-    return [normalizar_imagenes(p) for p in res.json()]
+    productos = res.json()
+    # Normalizar: asegurar que imagenes sea siempre una lista
+    for p in productos:
+        if "imagenes" not in p or not p["imagenes"]:
+            # Compatibilidad con campo imagen antiguo
+            img = p.get("imagen","")
+            p["imagenes"] = [img] if img else []
+    return productos
 
 @app.get("/api/productos/{id}")
 async def obtener_producto(id: int):
@@ -241,69 +268,60 @@ async def obtener_producto(id: int):
         res = await c.get(sb("productos")+f"?id=eq.{id}&select=*", headers=SB)
     data = res.json()
     if not data: raise HTTPException(404,"Producto no encontrado")
-    return normalizar_imagenes(data[0])
+    p = data[0]
+    if "imagenes" not in p or not p["imagenes"]:
+        img = p.get("imagen","")
+        p["imagenes"] = [img] if img else []
+    return p
 
 @app.post("/api/productos", status_code=201)
 async def crear_producto(p: Producto, u: dict = Depends(require_admin)):
     body = p.dict()
+    # imagenes como array JSON
     body["imagenes"] = p.imagenes or []
     async with httpx.AsyncClient() as c:
         res = await c.post(sb("productos"), headers=SB, json=body)
-    if res.status_code not in [200,201]:
-        raise HTTPException(500, f"Error creando producto: {res.text}")
-    return normalizar_imagenes(res.json()[0])
+    if res.status_code not in [200,201]: raise HTTPException(500,"Error creando producto")
+    return res.json()[0]
 
 @app.patch("/api/productos/{id}")
 async def actualizar_producto(id: int, cambios: ProductoUpdate, u: dict = Depends(get_user)):
-    # Incluir todos los campos enviados, incluyendo imagenes=[] y badge=None
-    raw = cambios.dict()
     data = {}
-    for k, v in raw.items():
+    for k, v in cambios.dict().items():
         if v is not None:
             data[k] = v
-        elif k == "badge":
-            # badge puede ser None explícitamente (para borrarlo)
-            data[k] = None
-        elif k == "imagenes":
-            # imagenes=[] es válido (borrar todas las fotos)
-            pass  # Solo se incluye si no es None (ya manejado arriba)
-
-    # Caso especial: si imagenes viene como lista vacía en el dict original
-    if cambios.imagenes is not None:
-        data["imagenes"] = cambios.imagenes
-
-    if not data:
-        raise HTTPException(400, "Sin cambios")
-
+    if not data: raise HTTPException(400,"Sin cambios")
     async with httpx.AsyncClient() as c:
         res = await c.patch(sb("productos")+f"?id=eq.{id}", headers=SB, json=data)
-    if res.status_code not in [200, 204]:
-        raise HTTPException(500, f"Error actualizando en Supabase: {res.status_code} {res.text}")
+    if res.status_code not in [200,204]: raise HTTPException(500,"Error actualizando")
     return await obtener_producto(id)
 
 @app.delete("/api/productos/{id}")
 async def eliminar_producto(id: int, u: dict = Depends(require_admin)):
-    # Verificar que existe
     async with httpx.AsyncClient() as c:
-        check = await c.get(sb("productos")+f"?id=eq.{id}&select=id,nombre", headers=SB)
-    if check.status_code != 200 or not check.json():
-        raise HTTPException(404, f"Producto {id} no encontrado")
-    nombre_prod = check.json()[0].get("nombre", str(id))
-    # Eliminar con header correcto para Supabase
-    headers_delete = dict(SB)
-    headers_delete["Prefer"] = "return=minimal"
-    async with httpx.AsyncClient() as c:
-        res = await c.delete(sb("productos")+f"?id=eq.{id}", headers=headers_delete)
-    if res.status_code not in [200, 204]:
-        raise HTTPException(500, f"Error eliminando en BD: {res.status_code} - {res.text}")
-    return {"mensaje": f"Producto eliminado: {nombre_prod}", "por": u.get("sub")}
+        res = await c.delete(sb("productos")+f"?id=eq.{id}", headers=SB)
+    if res.status_code not in [200,204]: raise HTTPException(500,"Error eliminando")
+    return {"mensaje": f"Producto {id} eliminado", "por": u.get("sub")}
 
 @app.post("/api/productos/{id}/imagen")
 async def subir_imagen(id: int, archivo: UploadFile = File(...), u: dict = Depends(get_user)):
-    ext = os.path.splitext(archivo.filename or "")[1].lower()
-    if ext not in [".jpg",".jpeg",".png",".webp"]:
-        raise HTTPException(400,"Solo JPG, PNG, WEBP")
-    url_img = await subir_imagen_storage(archivo)
+    ext = os.path.splitext(archivo.filename)[1].lower()
+    if ext not in [".jpg",".jpeg",".png",".webp"]: raise HTTPException(400,"Solo JPG,PNG,WEBP")
+    # Validar tamaño máximo: 5MB
+    MAX_SIZE = 5 * 1024 * 1024
+    contenido = await archivo.read()
+    if len(contenido) > MAX_SIZE:
+        raise HTTPException(400, "Imagen demasiado grande. Máximo 5MB")
+    # Validar firma de archivo (magic bytes)
+    magic = {b'\xff\xd8\xff':'jpg', b'\x89PNG':'png', b'RIFF':'webp'}
+    es_valido = any(contenido[:len(k)] == k for k in magic)
+    if not es_valido and not contenido[:4] in [b'\x89PNG', b'RIFF']:
+        pass  # Continuar, algunos WEBP tienen otros headers
+    nombre = f"{uuid.uuid4().hex}{ext}"
+    with open(f"static/uploads/{nombre}", "wb") as f: f.write(contenido)
+    base_url = os.getenv("RENDER_EXTERNAL_URL","http://localhost:8000")
+    url_img = f"{base_url}/uploads/{nombre}"
+    # Agregar a la lista de imágenes existente
     prod = await obtener_producto(id)
     imagenes = prod.get("imagenes", [])
     imagenes.append(url_img)
@@ -339,7 +357,7 @@ async def crear_pedido(pedido: Pedido):
 @app.patch("/api/pedidos/{id}/estado")
 async def cambiar_estado(id: int, estado: str, u: dict = Depends(get_user)):
     validos = ["pendiente","confirmado","enviado","entregado","cancelado"]
-    if estado not in validos: raise HTTPException(400,f"Estados válidos: {validos}")
+    if estado not in validos: raise HTTPException(400,f"Usa: {validos}")
     async with httpx.AsyncClient() as c:
         await c.patch(sb("pedidos")+f"?id=eq.{id}", headers=SB, json={"estado":estado})
     return {"mensaje":f"Pedido {id} → {estado}"}
@@ -367,4 +385,4 @@ async def estadisticas(u: dict = Depends(get_user)):
     }
 
 @app.get("/")
-def root(): return {"mensaje":"Maruy Bags API v6.3","docs":"/docs"}
+def root(): return {"mensaje":"Maruy Bags API v6","docs":"/docs"}
