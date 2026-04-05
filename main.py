@@ -306,22 +306,50 @@ async def eliminar_producto(id: int, u: dict = Depends(require_admin)):
 @app.post("/api/productos/{id}/imagen")
 async def subir_imagen(id: int, archivo: UploadFile = File(...), u: dict = Depends(get_user)):
     ext = os.path.splitext(archivo.filename)[1].lower()
-    if ext not in [".jpg",".jpeg",".png",".webp"]: raise HTTPException(400,"Solo JPG,PNG,WEBP")
+    if ext not in [".jpg",".jpeg",".png",".webp"]:
+        raise HTTPException(400, "Solo JPG, PNG o WEBP")
+
     # Validar tamaño máximo: 5MB
     MAX_SIZE = 5 * 1024 * 1024
     contenido = await archivo.read()
     if len(contenido) > MAX_SIZE:
         raise HTTPException(400, "Imagen demasiado grande. Máximo 5MB")
-    # Validar firma de archivo (magic bytes)
-    magic = {b'\xff\xd8\xff':'jpg', b'\x89PNG':'png', b'RIFF':'webp'}
-    es_valido = any(contenido[:len(k)] == k for k in magic)
-    if not es_valido and not contenido[:4] in [b'\x89PNG', b'RIFF']:
-        pass  # Continuar, algunos WEBP tienen otros headers
+
+    # Nombre único para la imagen
     nombre = f"{uuid.uuid4().hex}{ext}"
-    with open(f"static/uploads/{nombre}", "wb") as f: f.write(contenido)
-    base_url = os.getenv("RENDER_EXTERNAL_URL","http://localhost:8000")
-    url_img = f"{base_url}/uploads/{nombre}"
-    # Agregar a la lista de imágenes existente
+
+    # ── SUBIR A SUPABASE STORAGE (persistente, no se borra) ──────────────────
+    # El bucket "imagenes-productos" ya existe en tu Supabase
+    storage_url = f"{SUPABASE_URL}/storage/v1/object/imagenes-productos/{nombre}"
+    content_type_map = {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp"
+    }
+    content_type = content_type_map.get(ext, "image/jpeg")
+
+    storage_headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": content_type,
+        "x-upsert": "true"  # Sobrescribir si existe
+    }
+
+    async with httpx.AsyncClient() as c:
+        res = await c.post(storage_url, content=contenido, headers=storage_headers)
+
+    if res.status_code not in [200, 201]:
+        # Fallback: guardar localmente si Supabase falla
+        with open(f"static/uploads/{nombre}", "wb") as f:
+            f.write(contenido)
+        base_url = os.getenv("RENDER_EXTERNAL_URL", "http://localhost:8000")
+        url_img = f"{base_url}/uploads/{nombre}"
+    else:
+        # URL pública de Supabase Storage — permanente ✅
+        url_img = f"{SUPABASE_URL}/storage/v1/object/public/imagenes-productos/{nombre}"
+
+    # Agregar a la lista de imágenes existente del producto
     prod = await obtener_producto(id)
     imagenes = prod.get("imagenes", [])
     imagenes.append(url_img)
