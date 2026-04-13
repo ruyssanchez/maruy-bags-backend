@@ -414,3 +414,125 @@ async def estadisticas(u: dict = Depends(get_user)):
 
 @app.get("/")
 def root(): return {"mensaje":"Maruy Bags API v6","docs":"/docs"}
+
+# ── CONFIGURACIÓN DE ENVÍOS (editable desde admin) ────────────────────────────
+class ConfigEnvio(BaseModel):
+    local_precio: float = 12000
+    local_ciudades: str = "Barranquilla,Soledad,Malambo,Galapa,Puerto Colombia"
+    inter_local: float = 12000
+    inter_regional: float = 25000
+    inter_nacional: float = 25000
+    inter_especial: float = 25000
+    coord_local: float = 12000
+    coord_regional: float = 20000
+    coord_nacional: float = 23000
+    coord_especial: float = 30000
+
+DEFAULT_CONFIG = {
+    "local_precio": 12000,
+    "local_ciudades": "Barranquilla,Soledad,Malambo,Galapa,Puerto Colombia",
+    "inter_local": 12000, "inter_regional": 25000,
+    "inter_nacional": 25000, "inter_especial": 25000,
+    "coord_local": 12000, "coord_regional": 20000,
+    "coord_nacional": 23000, "coord_especial": 30000
+}
+
+@app.get("/api/config/envio")
+async def get_config_envio():
+    """Configuración pública de tarifas de envío"""
+    try:
+        async with httpx.AsyncClient() as c:
+            res = await c.get(
+                f"{SUPABASE_URL}/rest/v1/configuracion?clave=eq.envio_tarifas&select=valor",
+                headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+            )
+        if res.status_code == 200:
+            data = res.json()
+            if data and len(data) > 0:
+                import json as _json
+                return _json.loads(data[0]["valor"])
+    except Exception:
+        pass
+    return DEFAULT_CONFIG
+
+@app.put("/api/config/envio")
+async def update_config_envio(config: ConfigEnvio, u: dict = Depends(require_admin)):
+    """Actualizar tarifas de envío - solo admin"""
+    import json as _json
+    valor = _json.dumps(config.dict())
+    async with httpx.AsyncClient() as c:
+        # Try upsert
+        res = await c.post(
+            f"{SUPABASE_URL}/rest/v1/configuracion",
+            headers={
+                "apikey": SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+                "Content-Type": "application/json",
+                "Prefer": "resolution=merge-duplicates"
+            },
+            content=_json.dumps({"clave": "envio_tarifas", "valor": valor})
+        )
+    if res.status_code not in [200, 201]:
+        raise HTTPException(500, "Error guardando configuración")
+    return {"ok": True, "config": config.dict()}
+
+# ── PEDIDOS WHATSAPP (registro cuando cliente va a WA) ─────────────────────────
+class PedidoWA(BaseModel):
+    producto_id: int
+    producto_nombre: str
+    producto_precio: float
+    cliente_nombre: str
+    cliente_telefono: str
+    cliente_ciudad: str
+    cliente_departamento: str = ""
+    cliente_direccion: str
+    cliente_cedula: str = ""
+    cliente_notas: str = ""
+    transportadora: str = ""
+    envio_precio: float = 0
+    total: float = 0
+
+@app.post("/api/pedidos/whatsapp")
+async def registrar_pedido_wa(pedido: PedidoWA):
+    """Registrar pedido cuando cliente da clic en WhatsApp - público"""
+    import json as _json
+    # Validaciones de seguridad
+    if not (0 < pedido.producto_id < 1_000_000):
+        raise HTTPException(400, "ID inválido")
+    if not (0 <= pedido.producto_precio <= 200_000):
+        raise HTTPException(400, "Precio inválido")
+    if not (0 <= pedido.envio_precio <= 100_000):
+        raise HTTPException(400, "Envío inválido")
+    if len(pedido.cliente_nombre) > 80:
+        raise HTTPException(400, "Nombre muy largo")
+    if pedido.cliente_cedula and not pedido.cliente_cedula.isdigit():
+        raise HTTPException(400, "Cédula inválida")
+
+    data = {
+        "cliente_nombre": pedido.cliente_nombre[:80],
+        "cliente_telefono": pedido.cliente_telefono[:20],
+        "cliente_ciudad": f"{pedido.cliente_departamento} - {pedido.cliente_ciudad}"[:100],
+        "productos": _json.dumps([{
+            "id": pedido.producto_id,
+            "nombre": pedido.producto_nombre[:100],
+            "precio": pedido.producto_precio,
+            "cantidad": 1
+        }]),
+        "total": pedido.total,
+        "notas": f"Dir: {pedido.cliente_direccion[:100]} | Ced: {pedido.cliente_cedula} | Transp: {pedido.transportadora} | Envío: ${pedido.envio_precio} | {pedido.cliente_notas[:100]}"
+    }
+
+    async with httpx.AsyncClient() as c:
+        res = await c.post(
+            f"{SUPABASE_URL}/rest/v1/pedidos",
+            headers={
+                "apikey": SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+                "Content-Type": "application/json",
+                "Prefer": "return=representation"
+            },
+            content=_json.dumps(data)
+        )
+    if res.status_code not in [200, 201]:
+        raise HTTPException(500, "Error registrando pedido")
+    return {"ok": True}
